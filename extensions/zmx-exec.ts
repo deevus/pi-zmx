@@ -127,7 +127,7 @@ export default async function (pi: ExtensionAPI) {
 
 			// Derive zmx session name:
 			// 1. User-provided param
-			// 2. pi session display name (set via /session-name or pi.setSessionName)
+			// 2. pi session display name (set via pi.setSessionName())
 			// 3. Neither — require the user to provide one
 			const piSessionName = pi
 				.getSessionName()

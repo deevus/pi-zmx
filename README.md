@@ -65,11 +65,7 @@ zmx_history(session="my-project")
 
 ### Auto session naming
 
-Set a pi session name and `zmx_run` will use it automatically with no `session` param needed:
-
-```
-/session-name my-project
-```
+Set a pi session name via `pi.setSessionName()` in an extension (e.g. the [session-name example](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/session-name.ts)) and `zmx_run` will use it automatically with no `session` param needed.
 
 ## License
 
