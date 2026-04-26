@@ -1,6 +1,6 @@
 {
   "name": "@deevus/pi-zmx",
-  "version": "0.0.4",
+  "version": "0.1.0",
   "description": "Execute shell commands in persistent zmx sessions from pi",
   "keywords": ["pi-package"],
   "license": "MIT",
