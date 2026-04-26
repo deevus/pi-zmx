@@ -91,16 +91,16 @@ export default async function (pi: ExtensionAPI) {
 		name: "zmx_run",
 		label: "ZMX Run",
 		description:
-			"Execute a shell command inside a persistent zmx session. " +
-			"Use for long-running processes, multi-step workflows, or any command that benefits from persistent terminal state. " +
-			"Filesystem side effects, background processes, and exported env vars persist across calls. " +
-			"Each command runs via `sh -c` so shell operators (&&, |, >) work correctly, but `cd` inside one call does not affect the next call's working directory — use absolute paths or chain commands in one call.",
+			"Execute a shell command inside a persistent zmx session (synchronous). " +
+			"The command runs directly (no shell wrapper) so use `&&` for chaining and absolute paths for directory changes. " +
+			"Results are returned directly — no need for zmx_wait or zmx_history to check output.",
 		promptSnippet: "Execute shell commands inside persistent zmx sessions",
 		promptGuidelines: [
-			"Use zmx_run when you need persistent terminal state across commands (exported vars, background processes, filesystem effects).",
-			"Use zmx_run for long-running processes that should survive the agent turn.",
+			"Use zmx_run for shell commands that need persistent terminal state (exported vars, background processes).",
+			"Commands run synchronously — output is returned directly, no need for zmx_wait.",
+			"No shell wrapper: use `&&` or `;` to chain commands, use `cd /path && command` for directory changes.",
 			"If no session name is provided, zmx_run uses the pi session display name. If that is also unset, the session param is required.",
-			"Use zmx_attach when a task requires human interaction: entering passwords, sudo prompts, interactive installers, or any interactive program. Start the process with zmx_run, then call zmx_attach to prompt the human to attach and complete the interaction, then zmx_wait + zmx_history to continue.",
+			"Use zmx_attach for interactive tasks requiring human input (passwords, sudo, vim, etc.).",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Shell command to execute" }),
@@ -168,17 +168,18 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 
-			// 2) Send command detached (non-blocking)
-			const runResult = await zmxExec(["run", session, "-d", "sh", "-c", command], { timeout: 15 });
+			// 2) Run command synchronously (blocking)
+			const runResult = await zmxExec(["run", session, command], { timeout: params.timeout ?? 30 });
+
 			if (runResult.code !== 0) {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Failed to send command to session "${session}": ${runResult.stderr || runResult.stdout}`,
+							text: runResult.stderr || runResult.stdout || `Command failed with exit code ${runResult.code}`,
 						},
 					],
-					details: { session, command, error: runResult.stderr || runResult.stdout },
+					details: { session, command, exitCode: runResult.code, stderr: runResult.stderr },
 					isError: true,
 				};
 			}
@@ -187,10 +188,10 @@ export default async function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: `Command sent to session "${session}". Use zmx_history to check output or zmx_attach for interactive access.`,
+						text: runResult.stdout || "Command completed successfully (no output).",
 					},
 				],
-				details: { session, command, sent: true },
+				details: { session, command, exitCode: 0, stdout: runResult.stdout },
 			};
 		},
 	});
