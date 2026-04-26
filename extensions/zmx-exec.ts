@@ -92,18 +92,19 @@ export default async function (pi: ExtensionAPI) {
 		label: "ZMX Run",
 		description:
 			"Execute a shell command inside a persistent zmx session (synchronous). " +
-			"The command runs directly (no shell wrapper) so use `&&` for chaining and absolute paths for directory changes. " +
+			"The command runs directly (no shell wrapper). " +
 			"Results are returned directly — no need for zmx_wait or zmx_history to check output.",
 		promptSnippet: "Execute shell commands inside persistent zmx sessions",
 		promptGuidelines: [
 			"Use zmx_run for shell commands that need persistent terminal state (exported vars, background processes).",
 			"Commands run synchronously — output is returned directly, no need for zmx_wait.",
-			"No shell wrapper: use `&&` or `;` to chain commands, use `cd /path && command` for directory changes.",
+			"No shell wrapper: pass each argument as a separate array element.",
+			"Shell operators (&&, ||, ;, |, $VAR) are NOT supported — zmx escapes all arguments as literals. Use sh -c or bash -c when you need shell chaining, e.g. [\"sh\", \"-c\", \"echo hello && echo world\"].",
 			"If no session name is provided, zmx_run uses the pi session display name. If that is also unset, the session param is required.",
 			"Use zmx_attach for interactive tasks requiring human input (passwords, sudo, vim, etc.).",
 		],
 		parameters: Type.Object({
-			command: Type.String({ description: "Shell command to execute" }),
+			command: Type.Array(Type.String(), { description: "Command to execute (argv array, no shell wrapper). Pass each argument as a separate array element." }),
 			session: Type.Optional(
 				Type.String({
 					description: "ZMX session name. Defaults to the pi session display name if set. Required if pi has no session name.",
@@ -124,6 +125,7 @@ export default async function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const command = params.command;
+			const commandStr = command.join(" ");
 
 			// Derive zmx session name:
 			// 1. User-provided param
@@ -150,7 +152,7 @@ export default async function (pi: ExtensionAPI) {
 			if (params.dryRun) {
 				return {
 					content: [
-						{ type: "text" as const, text: `[dry-run] zmx run ${session}: ${command}` },
+						{ type: "text" as const, text: `[dry-run] zmx run ${session}: ${commandStr}` },
 					],
 					details: { session, command, dryRun: true },
 				};
@@ -163,13 +165,13 @@ export default async function (pi: ExtensionAPI) {
 					content: [
 						{ type: "text" as const, text: `Failed to create/access session "${session}": ${ensured.error}` },
 					],
-					details: { session, command, error: ensured.error },
+					details: { session, command: commandStr, error: ensured.error },
 					isError: true,
 				};
 			}
 
 			// 2) Run command synchronously (blocking)
-			const runResult = await zmxExec(["run", session, command], { timeout: params.timeout ?? 30 });
+			const runResult = await zmxExec(["run", session, ...command], { timeout: params.timeout ?? 30 });
 
 			if (runResult.code !== 0) {
 				return {
@@ -179,7 +181,7 @@ export default async function (pi: ExtensionAPI) {
 							text: runResult.stderr || runResult.stdout || `Command failed with exit code ${runResult.code}`,
 						},
 					],
-					details: { session, command, exitCode: runResult.code, stderr: runResult.stderr },
+					details: { session, command: commandStr, exitCode: runResult.code, stderr: runResult.stderr },
 					isError: true,
 				};
 			}
@@ -191,7 +193,7 @@ export default async function (pi: ExtensionAPI) {
 						text: runResult.stdout || "Command completed successfully (no output).",
 					},
 				],
-				details: { session, command, exitCode: 0, stdout: runResult.stdout },
+				details: { session, command: commandStr, exitCode: 0, stdout: runResult.stdout },
 			};
 		},
 	});
