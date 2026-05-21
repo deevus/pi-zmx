@@ -1,8 +1,10 @@
 {
   "name": "@deevus/pi-zmx",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Execute shell commands in persistent zmx sessions from pi",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -13,6 +15,8 @@
     "url": "https://github.com/deevus/pi-zmx.git"
   },
   "pi": {
-    "extensions": ["./extensions/zmx-exec.ts"]
+    "extensions": [
+      "./extensions/zmx-exec.ts"
+    ]
   }
 }
