@@ -18,11 +18,46 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { join } from "node:path";
+import {
+	configFromEnv,
+	mergeConfig,
+	parseRunOutput,
+	readConfigFile,
+	resolveSessionCreate,
+	sanitizeText,
+	stripAnsi,
+	type SessionCreate,
+} from "./zmx-lib.ts";
 
 // ─── Extension ──────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
+	// CLI override for the session shell (highest precedence). See zmx-lib.
+	pi.registerFlag("zmx-shell", {
+		description: "Shell for new zmx sessions: clean | full | <path to shell>",
+		type: "string",
+	});
+
+	// How sessions are created (shell + env), resolved lazily on first use so
+	// CLI flags are parsed and the project cwd is known. Precedence:
+	//   --zmx-shell > $PI_ZMX_* > <cwd>/.pi/zmx.json > ~/.pi/agent/zmx.json > default
+	let cachedCreate: SessionCreate | undefined;
+	function sessionCreateFor(cwd: string): SessionCreate {
+		if (cachedCreate) return cachedCreate;
+		const flagShell =
+			typeof pi.getFlag === "function" ? (pi.getFlag("zmx-shell") as string | undefined) : undefined;
+		const config = mergeConfig(
+			flagShell ? { shell: flagShell } : undefined,
+			configFromEnv(process.env),
+			readConfigFile(join(cwd, CONFIG_DIR_NAME, "zmx.json")),
+			readConfigFile(join(getAgentDir(), "zmx.json")),
+		);
+		cachedCreate = resolveSessionCreate(config);
+		return cachedCreate;
+	}
 	// Verify zmx is available on PATH
 	try {
 		await pi.exec("zmx", ["version"]);
@@ -51,10 +86,21 @@ export default async function (pi: ExtensionAPI) {
 
 	async function zmxExec(
 		args: string[],
-		options?: { timeout?: number },
+		options?: { timeout?: number; env?: Record<string, string> },
 	): Promise<{ stdout: string; stderr: string; code: number }> {
 		try {
-			const result = await pi.exec("zmx", args, {
+			// When creating a session we need extra env (SHELL, PS1, ...) to reach
+			// the zmx client that spawns the PTY. Run via `/usr/bin/env K=V ... zmx`
+			// so it applies regardless of whether pi.exec forwards a custom env.
+			const env = options?.env;
+			const [cmd, cmdArgs]: [string, string[]] =
+				env && Object.keys(env).length > 0
+					? [
+							"/usr/bin/env",
+							[...Object.entries(env).map(([k, v]) => `${k}=${v}`), "zmx", ...args],
+						]
+					: ["zmx", args];
+			const result = await pi.exec(cmd, cmdArgs, {
 				timeout: (options?.timeout ?? 30) * 1000,
 			});
 			return {
@@ -74,11 +120,16 @@ export default async function (pi: ExtensionAPI) {
 		return result.stdout.split("\n").filter(Boolean);
 	}
 
-	async function ensureSession(session: string): Promise<{ ok: boolean; error?: string }> {
+	async function ensureSession(
+		session: string,
+		createEnv: Record<string, string>,
+	): Promise<{ ok: boolean; error?: string }> {
 		const sessions = await listSessions();
 		if (sessions.includes(session)) return { ok: true };
 
-		const result = await zmxExec(["run", session, "true"], { timeout: 10 });
+		// Create the session with the clean shell + controlled prompt so its PTY
+		// doesn't run the full interactive login shell (see resolveSessionCreate).
+		const result = await zmxExec(["run", session, "true"], { timeout: 10, env: createEnv });
 		if (result.code !== 0) {
 			return { ok: false, error: result.stderr || result.stdout || `failed to create session "${session}"` };
 		}
@@ -98,6 +149,7 @@ export default async function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use zmx_run for shell commands that need persistent terminal state (exported vars, background processes).",
 			"Commands run synchronously — output is returned directly, no need for zmx_wait.",
+			"Output is sanitized: terminal escape/prompt sequences are stripped, so it is safe to parse even with complex user shells.",
 			"No shell wrapper: pass each argument as a separate array element.",
 			"Shell operators (&&, ||, ;, |, $VAR) are NOT supported — zmx escapes all arguments as literals. Use sh -c or bash -c when you need shell chaining, e.g. [\"sh\", \"-c\", \"echo hello && echo world\"].",
 			"If no session name is provided, zmx_run uses the pi session display name. If that is also unset, the session param is required.",
@@ -158,8 +210,8 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 
-			// 1) Ensure session exists
-			const ensured = await ensureSession(session);
+			// 1) Ensure session exists (created with the resolved clean/full shell)
+			const ensured = await ensureSession(session, sessionCreateFor(ctx.cwd).env);
 			if (!ensured.ok) {
 				return {
 					content: [
@@ -173,15 +225,36 @@ export default async function (pi: ExtensionAPI) {
 			// 2) Run command synchronously (blocking)
 			const runResult = await zmxExec(["run", session, ...command], { timeout: params.timeout ?? 30 });
 
+			// zmx itself failed to run the command (bad session, timeout, etc.).
 			if (runResult.code !== 0) {
+				const { text } = parseRunOutput(runResult.stdout);
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: runResult.stderr || runResult.stdout || `Command failed with exit code ${runResult.code}`,
+							text: sanitizeText(runResult.stderr) || text || `Command failed with exit code ${runResult.code}`,
 						},
 					],
-					details: { session, command: commandStr, exitCode: runResult.code, stderr: runResult.stderr },
+					details: { session, command: commandStr, exitCode: runResult.code, stderr: sanitizeText(runResult.stderr) },
+					isError: true,
+				};
+			}
+
+			// Sanitize captured PTY output and recover the inner command's real
+			// exit status from zmx's completion marker (more accurate than zmx's
+			// own exit code, which is 0 even when the inner command failed).
+			const { text, markerExit } = parseRunOutput(runResult.stdout);
+			const exitCode = markerExit ?? 0;
+
+			if (exitCode !== 0) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: text || `Command exited with code ${exitCode}.`,
+						},
+					],
+					details: { session, command: commandStr, exitCode, stdout: text },
 					isError: true,
 				};
 			}
@@ -190,10 +263,10 @@ export default async function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: runResult.stdout || "Command completed successfully (no output).",
+						text: text || "Command completed successfully (no output).",
 					},
 				],
-				details: { session, command: commandStr, exitCode: 0, stdout: runResult.stdout },
+				details: { session, command: commandStr, exitCode: 0, stdout: text },
 			};
 		},
 	});
@@ -213,7 +286,7 @@ export default async function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			const sessions = result.stdout || "(no active sessions)";
+			const sessions = stripAnsi(result.stdout) || "(no active sessions)";
 			return {
 				content: [{ type: "text" as const, text: sessions }],
 				details: { sessions: await listSessions() },
@@ -293,7 +366,7 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 
-			const allLines = result.stdout.split("\n");
+			const allLines = sanitizeText(result.stdout).split("\n");
 			const tail = allLines.slice(-lines).join("\n");
 
 			return {
@@ -419,7 +492,7 @@ export default async function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Attach with: zmx attach ${target}`, "info");
 					break;
 				case "new": {
-					const r = await zmxExec(["run", target, "echo", `"zmx session ${target} initialized"`], { timeout: 10 });
+					const r = await zmxExec(["run", target, "echo", `"zmx session ${target} initialized"`], { timeout: 10, env: sessionCreateFor(ctx.cwd).env });
 					if (r.code === 0) {
 						ctx.ui.notify(`Session "${target}" created. Attach with: zmx attach ${target}`, "success");
 					} else {

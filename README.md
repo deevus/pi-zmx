@@ -19,6 +19,57 @@ brew install neurosnap/tap/zmx
 
 Or download a binary directly from [zmx.sh](https://zmx.sh/#binaries).
 
+## Configuration
+
+### Session shell
+
+zmx creates a session by spawning a **login `$SHELL`**. If that is your real
+interactive shell (fish/zsh/bash with starship, atuin, or other shell
+integrations), it emits OSC / prompt escape sequences that get interleaved
+with the command output this extension captures. To stay robust the extension
+both (a) creates sessions in a quiet shell and (b) sanitizes all captured
+output (stripping escape/prompt sequences), so it survives arbitrarily complex
+prompts.
+
+The `shell` setting selects how new sessions are created:
+
+| Value | Behavior |
+| --- | --- |
+| _unset_ or `clean` | **Default.** Spawn `/bin/sh` (fallback `/bin/bash`) with a simple controlled prompt and no prompt-framework hooks. |
+| `full` / `interactive` / `login` | Use your real login `$SHELL` — full interactive prompt (original behavior). |
+| _any other value_ | Treated as a custom shell path, e.g. a wrapper that execs `bash --noprofile --norc -i`. |
+
+The `ps1` setting overrides the clean-mode prompt string (default: `zmx$ `).
+
+#### Where to set it (highest precedence first)
+
+1. **CLI flag:** `pi --zmx-shell full` (or `--zmx-shell /path/to/shell`)
+2. **Environment:** `PI_ZMX_SHELL` / `PI_ZMX_PS1`
+3. **Project config:** `<cwd>/.pi/zmx.json`
+4. **Global config:** `~/.pi/agent/zmx.json`
+5. Built-in default (`clean`)
+
+The JSON config files are the idiomatic pi mechanism (same pattern as pi's
+`presets.json`) and let you use, say, `full` in one repo and `clean` elsewhere:
+
+```json
+// ~/.pi/agent/zmx.json  (or  <project>/.pi/zmx.json)
+{
+  "shell": "clean",
+  "ps1": "zmx$ "
+}
+```
+
+```bash
+# One-off override for a single run:
+pi --zmx-shell full
+
+# Or via environment:
+export PI_ZMX_SHELL=full
+```
+
+The setting only affects **newly created** sessions.
+
 ## Install
 
 ```bash
