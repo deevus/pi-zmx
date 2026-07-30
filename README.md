@@ -64,6 +64,27 @@ zmx_history(session="my-project")
 ```
 
 
+## Host-state awareness
+
+A zmx session is **persistent** and can outlive the connection that created it.
+If a session's shell was reached over SSH (or any remote/nested shell) and that
+connection drops, subsequent `zmx_run` commands can silently fall back to a
+**different host, user, or working directory** — a real hazard for long-running
+agents.
+
+The extension surfaces this to the agent via `zmx_run`'s prompt guidelines so it
+knows to:
+
+- Watch for tells that the shell was replaced between calls (prompt/`PS1`
+  changed, `pwd` moved, exported vars or `cd` gone, background processes
+  vanished, previously-working commands now "not found").
+- Verify identity before state-dependent or destructive actions with a cheap
+  probe, e.g. `zmx_run(command=["sh", "-c", "hostname; whoami; pwd"])`.
+- Set a tripwire at session start (`export ZMX_RUNID=<value>`) and re-read it
+  later — if it's empty, the shell was replaced.
+- Stop and surface the change to the user, re-establish the cwd/env (and
+  reconnect SSH) before resuming, rather than continuing on the wrong host.
+
 ## License
 
 MIT
