@@ -102,6 +102,10 @@ export default async function (pi: ExtensionAPI) {
 			"Shell operators (&&, ||, ;, |, $VAR) are NOT supported — zmx escapes all arguments as literals. Use sh -c or bash -c when you need shell chaining, e.g. [\"sh\", \"-c\", \"echo hello && echo world\"].",
 			"If no session name is provided, zmx_run uses the pi session display name. If that is also unset, the session param is required.",
 			"Use zmx_attach for interactive tasks requiring human input (passwords, sudo, vim, etc.).",
+			"Host-state awareness: a zmx session is persistent and may outlive the connection that created it. If the session shell was reached over SSH (or any remote/nested shell) and that connection dropped, later commands can silently fall back to running on a DIFFERENT host, user, or working directory than earlier commands in the same session.",
+			"Watch for signs the host state changed between calls: the shell prompt/PS1 changed, `pwd` is no longer where you left it, previously-exported env vars or `cd` are gone, background processes you started have vanished, or a command that worked before now reports 'command not found' / different paths.",
+			"For long-running work, don't assume continuity. Before commands that depend on prior session state (or before any destructive/irreversible action), verify identity by running a cheap probe such as `sh -c 'hostname; whoami; pwd'` and confirm it matches where earlier steps ran. Establishing an env var like a run-id at session start (`export ZMX_RUNID=<value>`) and re-reading it later is a reliable tripwire — if it's empty, the shell was replaced.",
+			"If you detect the host/state changed unexpectedly, stop and surface it to the user rather than continuing. Re-establish the working directory and environment (and reconnect any SSH) before resuming, and treat any in-flight state as lost.",
 		],
 		parameters: Type.Object({
 			command: Type.Array(Type.String(), { description: "Command to execute (argv array, no shell wrapper). Pass each argument as a separate array element." }),
