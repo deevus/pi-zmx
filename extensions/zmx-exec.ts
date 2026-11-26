@@ -6,12 +6,15 @@
  * env vars persist across calls within the same session.
  *
  * Tools:
- *   zmx_run     - Run a shell command in a zmx session
- *   zmx_list    - List active zmx sessions
- *   zmx_kill    - Kill one or more zmx sessions
- *   zmx_history - View recent output from a session
- *   zmx_wait    - Wait for session tasks to complete
- *   zmx_attach  - Show instructions for manually attaching to a session
+ *   zmx_run             - Run a shell command in a zmx session (synchronous)
+ *   zmx_run_background  - Start a long task and get a message when it exits
+ *   zmx_watch           - Watch an already-running session until its task exits
+ *   zmx_unwatch         - Stop watching a session
+ *   zmx_list            - List active zmx sessions
+ *   zmx_kill            - Kill one or more zmx sessions
+ *   zmx_history         - View recent output from a session
+ *   zmx_wait            - Wait for session tasks to complete (blocking)
+ *   zmx_attach          - Show instructions for manually attaching to a session
  *
  * Commands:
  *   /zmx       - Open interactive zmx session manager
@@ -33,7 +36,17 @@ export default async function (pi: ExtensionAPI) {
 			"Or download a binary directly from https://zmx.sh/#binaries\n" +
 			"Then restart pi.";
 		// Register a stub tool that surfaces the error instead of silently failing
-		for (const name of ["zmx_run", "zmx_list", "zmx_kill", "zmx_history", "zmx_wait", "zmx_attach"]) {
+		for (const name of [
+			"zmx_run",
+			"zmx_run_background",
+			"zmx_watch",
+			"zmx_unwatch",
+			"zmx_list",
+			"zmx_kill",
+			"zmx_history",
+			"zmx_wait",
+			"zmx_attach",
+		]) {
 			pi.registerTool({
 				name,
 				label: name,
@@ -85,6 +98,246 @@ export default async function (pi: ExtensionAPI) {
 		return { ok: true };
 	}
 
+	// ── Session metadata ────────────────────────────────────────────────────
+
+	interface ZmxSessionInfo {
+		name: string;
+		created?: number;
+		ended?: number;
+		exitCode?: number;
+		cmd?: string;
+		cwd?: string;
+	}
+
+	function parseSessionInfo(line: string): ZmxSessionInfo | undefined {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("name=")) return undefined;
+		const info: ZmxSessionInfo = { name: "" };
+		for (const field of trimmed.split("\t")) {
+			const eq = field.indexOf("=");
+			if (eq <= 0) continue;
+			const value = field.slice(eq + 1);
+			switch (field.slice(0, eq)) {
+				case "name":
+					info.name ||= value;
+					break;
+				case "created":
+					info.created ??= Number(value);
+					break;
+				case "ended":
+					info.ended ??= Number(value);
+					break;
+				case "exit_code":
+					info.exitCode ??= Number(value);
+					break;
+				case "cmd":
+					info.cmd ??= value;
+					break;
+				case "cwd":
+					info.cwd ??= value;
+					break;
+			}
+		}
+		return info.name ? info : undefined;
+	}
+
+	async function getSessionInfo(session: string): Promise<ZmxSessionInfo | undefined> {
+		const result = await zmxExec(["list"]);
+		if (result.code !== 0) return undefined;
+		for (const line of result.stdout.split("\n")) {
+			const info = parseSessionInfo(line);
+			if (info?.name === session) return info;
+		}
+		return undefined;
+	}
+
+	function resolveSessionName(explicit?: string): string | undefined {
+		if (explicit) return explicit;
+		return (
+			pi
+				.getSessionName()
+				?.toLowerCase()
+				.replace(/\s+/g, "-")
+				.replace(/[^\w-]/g, "") || undefined
+		);
+	}
+
+	// ── Completion watchers ─────────────────────────────────────────────────
+	//
+	// `zmx wait <session>` blocks until the session's tracked task exits and
+	// returns its exit code. Running it in the background lets a long task
+	// outlive the tool call: when the wait returns, the extension injects a
+	// message into this session so the agent can continue its work instead of
+	// polling zmx_wait (and hitting tool timeouts) in a loop.
+
+	interface Watch {
+		session: string;
+		command?: string;
+		label?: string;
+		startedAt: number;
+		tailLines: number;
+		abort: AbortController;
+	}
+
+	const watches = new Map<string, Watch>();
+
+	function log(level: "warn" | "error", message: string): void {
+		try {
+			pi.logger?.[level]?.(message);
+		} catch {
+			// Logging must never break a watcher.
+		}
+	}
+
+	function deliverNotice(text: string): void {
+		try {
+			// A custom message wakes an idle session (triggerTurn) and steers a
+			// streaming one. Both pi and omp accept this payload; the native
+			// async-job delivery uses the same shape.
+			pi.sendMessage(
+				{ customType: "zmx.task-complete", content: text, display: true },
+				{ triggerTurn: true },
+			);
+		} catch (err) {
+			log(
+				"warn",
+				`zmx: could not deliver completion notice: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+
+	function formatDuration(ms: number): string {
+		const seconds = Math.max(0, Math.round(ms / 1000));
+		if (seconds < 60) return `${seconds}s`;
+		const minutes = Math.floor(seconds / 60);
+		const restSeconds = seconds % 60;
+		if (minutes < 60) return restSeconds ? `${minutes}m ${restSeconds}s` : `${minutes}m`;
+		const hours = Math.floor(minutes / 60);
+		const restMinutes = minutes % 60;
+		return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
+	}
+
+	async function readTail(session: string, lines: number): Promise<string | undefined> {
+		if (lines <= 0) return undefined;
+		const result = await zmxExec(["history", session], { timeout: 15 });
+		if (result.code !== 0 || !result.stdout) return undefined;
+		let tail = result.stdout.split("\n").slice(-lines).join("\n").trimEnd();
+		if (!tail) return undefined;
+		if (tail.length > 4000) tail = `…\n${tail.slice(-4000)}`;
+		return tail;
+	}
+
+	function stopWatch(session: string): boolean {
+		const watch = watches.get(session);
+		if (!watch) return false;
+		watches.delete(session);
+		watch.abort.abort();
+		return true;
+	}
+
+	async function notifyCompletion(
+		watch: Watch,
+		result: { stdout: string; stderr: string; code: number; killed: boolean },
+	): Promise<void> {
+		const info = await getSessionInfo(watch.session);
+		const disappeared = /disappeared before completing/.test(result.stderr);
+		const missing = result.code === 2 || /no matching sessions found/.test(result.stderr);
+		const parsed = /exit_code=(\d+)/.exec(result.stdout);
+		const exitCode = parsed ? Number(parsed[1]) : result.code;
+		const failed = !disappeared && !missing && exitCode !== 0;
+		const unknown = !disappeared && !missing && (result.killed || result.code === -1);
+
+		const lines: string[] = ["[zmx] Watched task exited; resume your previous work.", ""];
+		if (missing) {
+			lines.push(
+				`Session: ${watch.session}`,
+				"Status: unknown (the session disappeared before it could be watched; no exit code is available)",
+			);
+		} else if (disappeared) {
+			lines.push(
+				`Session: ${watch.session}`,
+				"Status: session ended (the session process exited; zmx does not track an exit code for this kind of session)",
+			);
+		} else if (unknown) {
+			const detail = result.stderr.split("\n")[0];
+			lines.push(
+				`Session: ${watch.session}`,
+				`Status: watcher stopped unexpectedly${detail ? `: ${detail}` : ""}`,
+			);
+		} else {
+			lines.push(
+				`Session: ${watch.session}`,
+				`Status: ${failed ? "FAILED" : "success"} (exit code ${exitCode})`,
+			);
+		}
+
+		if (watch.label) lines.push(`Label: ${watch.label}`);
+		const command = watch.command ?? info?.cmd;
+		if (command) lines.push(`Command: ${command}`);
+		if (!missing && !disappeared && !unknown) {
+			lines.push(`Duration: ${formatDuration(Date.now() - watch.startedAt)}`);
+		}
+		const cwd = info?.cwd?.replace(/^file:\/\/[^/]*/, "");
+		if (cwd) lines.push(`Working directory: ${cwd}`);
+
+		if (!missing) {
+			const tail = await readTail(watch.session, watch.tailLines);
+			if (tail) lines.push("", `Output tail (last ${watch.tailLines} lines):`, tail);
+		}
+
+		lines.push(
+			"",
+			`Continue your previous work now. Full scrollback: zmx_history(session="${watch.session}").`,
+		);
+
+		deliverNotice(lines.join("\n"));
+	}
+
+	function startWatch(input: { session: string; command?: string; label?: string; tailLines?: number }): void {
+		const watch: Watch = {
+			session: input.session,
+			command: input.command,
+			label: input.label,
+			startedAt: Date.now(),
+			tailLines: input.tailLines ?? 20,
+			abort: new AbortController(),
+		};
+		watches.set(watch.session, watch);
+
+		void (async () => {
+			let result: { stdout: string; stderr: string; code: number; killed: boolean };
+			try {
+				const execResult = await pi.exec("zmx", ["wait", watch.session], { signal: watch.abort.signal });
+				result = {
+					stdout: execResult.stdout ?? "",
+					stderr: execResult.stderr ?? "",
+					code: execResult.code ?? -1,
+					killed: Boolean(execResult.killed),
+				};
+			} catch (err) {
+				result = {
+					stdout: "",
+					stderr: err instanceof Error ? err.message : String(err),
+					code: -1,
+					killed: true,
+				};
+			}
+			if (watches.get(watch.session) === watch) watches.delete(watch.session);
+			if (watch.abort.signal.aborted) return;
+			await notifyCompletion(watch, result);
+		})().catch(err => {
+			log(
+				"warn",
+				`watcher for "${watch.session}" failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		});
+	}
+
+	pi.on("session_shutdown", () => {
+		for (const watch of watches.values()) watch.abort.abort();
+		watches.clear();
+	});
+
 	// ── z m x _ r u n ───────────────────────────────────────────────────────
 
 	pi.registerTool({
@@ -131,13 +384,7 @@ export default async function (pi: ExtensionAPI) {
 			// 1. User-provided param
 			// 2. pi session display name (set via pi.setSessionName())
 			// 3. Neither — require the user to provide one
-			const piSessionName = pi
-				.getSessionName()
-				?.toLowerCase()
-				.replace(/\s+/g, "-")
-				.replace(/[^\w-]/g, "") || undefined;
-
-			const session = params.session ?? piSessionName;
+			const session = resolveSessionName(params.session);
 
 			if (!session) {
 				return {
@@ -313,8 +560,9 @@ export default async function (pi: ExtensionAPI) {
 		name: "zmx_wait",
 		label: "ZMX Wait",
 		description:
-			"Wait for zmx session tasks to complete. Use after zmx_run to ensure " +
-			"a command has finished before checking zmx_history.",
+			"Block this turn until a zmx session's task completes (bounded by `timeout`). " +
+			"Prefer zmx_run_background or zmx_watch for long tasks: they return immediately and " +
+			"send a completion message instead of making the agent poll or time out.",
 		parameters: Type.Object({
 			session: Type.String({ description: "Session name" }),
 			timeout: Type.Optional(
@@ -342,6 +590,229 @@ export default async function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text" as const, text: `Session "${params.session}" tasks completed.` }],
 				details: { session: params.session, completed: true },
+			};
+		},
+	});
+
+	// ── z m x _ r u n _ b a c k g r o u n d ─────────────────────────────────
+
+	pi.registerTool({
+		name: "zmx_run_background",
+		label: "ZMX Run Background",
+		description:
+			"Start a long-running command in a zmx session and return immediately. " +
+			"The call ends your turn: you must stop generating after it returns. " +
+			"When the command exits you receive one message with the exit code and the last N lines of output, " +
+			"which starts your next turn.",
+		promptSnippet: "Start long-running zmx commands and get notified when they finish",
+		promptGuidelines: [
+			"Use zmx_run_background for commands that may run longer than a tool timeout: builds, training, simulations, long test suites.",
+			"After zmx_run_background or zmx_watch returns, STOP: make no further tool calls and add no commentary. End your turn immediately.",
+			"You will be woken by one message with the exit code and the output tail; that message starts your next turn. Do NOT poll with zmx_wait or zmx_history.",
+			"Commands in one session run sequentially — do not start a second background task in the same session while one is running.",
+			'No shell wrapper: pass each argument as a separate array element; use ["sh", "-c", "..."] for shell operators.',
+		],
+		parameters: Type.Object({
+			command: Type.Array(Type.String(), {
+				description: "Command to execute (argv array, no shell wrapper). Pass each argument as a separate array element.",
+			}),
+			session: Type.Optional(
+				Type.String({
+					description: "ZMX session name. Defaults to the pi session display name if set. Required if pi has no session name.",
+				}),
+			),
+			label: Type.Optional(
+				Type.String({ description: 'Short label used in the completion message (e.g. "nightly build").' }),
+			),
+			tailLines: Type.Optional(
+				Type.Integer({
+					description: "Output tail lines included in the completion message (default: 20, max: 200).",
+					minimum: 0,
+					maximum: 200,
+				}),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			const session = resolveSessionName(params.session);
+			if (!session) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: "No session name available. Either provide a `session` parameter or set a pi session name first.",
+					}],
+					isError: true,
+				};
+			}
+			if (watches.has(session)) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Already watching session "${session}". Wait for its completion message or call zmx_unwatch first.`,
+					}],
+					isError: true,
+				};
+			}
+			if (params.command.length === 0) {
+				return {
+					content: [{ type: "text" as const, text: "`command` must not be empty." }],
+					isError: true,
+				};
+			}
+
+			const command = params.command;
+			const result = await zmxExec(["run", session, "-d", ...command], { timeout: 30 });
+			if (result.code !== 0) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Failed to start background task in "${session}": ${result.stderr || result.stdout || `exit code ${result.code}`}`,
+					}],
+					isError: true,
+				};
+			}
+
+			startWatch({ session, command: command.join(" "), label: params.label, tailLines: params.tailLines });
+
+			const tailLines = params.tailLines ?? 20;
+			return {
+				content: [{
+					type: "text" as const,
+					text:
+						`Background task started in zmx session "${session}".\n\n` +
+						"STOP NOW: end your reply immediately. Do not call any more tools and do not add commentary. " +
+						`You will be woken by one message with the exit code and the last ${tailLines} lines of output ` +
+						"when the task exits; that message starts your next turn.",
+				}],
+				details: { session, command: command.join(" "), background: true },
+			};
+		},
+	});
+
+	// ── z m x _ w a t c h ───────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "zmx_watch",
+		label: "ZMX Watch",
+		description:
+			"Watch a zmx session that is already running a command and get a message when the command exits. " +
+			"The call ends your turn: you must stop generating after it returns. " +
+			"Tracks the task most recently started with `zmx run` in that session. " +
+			"For sessions created with `zmx attach <name> <command>`, the notice reports when the session process exits.",
+		promptSnippet: "Watch an already-running zmx session and get notified on completion",
+		promptGuidelines: [
+			"Use zmx_watch when a long command was started in a zmx session outside this tool call (another agent, a shell, a previous session).",
+			"After zmx_watch returns, STOP: make no further tool calls and add no commentary. End your turn immediately.",
+			"You will be woken by one message with the exit code and the output tail; that message starts your next turn. Do NOT poll with zmx_wait.",
+			"Only tasks started with `zmx run` are tracked. An interactive shell session with no command only reports when the session itself ends.",
+			"If the session's last task already finished, the tool returns that result immediately instead of waiting.",
+		],
+		parameters: Type.Object({
+			session: Type.String({ description: "Session name to watch" }),
+			label: Type.Optional(
+				Type.String({ description: "Short label used in the completion message." }),
+			),
+			tailLines: Type.Optional(
+				Type.Integer({
+					description: "Output tail lines included in the completion message (default: 20, max: 200).",
+					minimum: 0,
+					maximum: 200,
+				}),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			const session = params.session;
+			const info = await getSessionInfo(session);
+			if (!info) {
+				const sessions = await listSessions();
+				return {
+					content: [{
+						type: "text" as const,
+						text: sessions.length
+							? `No zmx session named "${session}". Active sessions: ${sessions.join(", ")}`
+							: `No zmx session named "${session}". There are no active zmx sessions.`,
+					}],
+					isError: true,
+				};
+			}
+			if (watches.has(session)) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `Already watching session "${session}". Wait for its completion message or call zmx_unwatch first.`,
+					}],
+					isError: true,
+				};
+			}
+
+			const tailLines = params.tailLines ?? 20;
+			if (info.ended !== undefined) {
+				const exitCode = info.exitCode ?? 0;
+				const tail = await readTail(session, tailLines);
+				const lines = [
+					`[zmx] Session "${session}" is not running a task: its last task already finished (exit code ${exitCode}).`,
+				];
+				if (info.cmd) lines.push(`Command: ${info.cmd}`);
+				if (tail) lines.push("", `Output tail (last ${tailLines} lines):`, tail);
+				lines.push("", `Full scrollback: zmx_history(session="${session}").`);
+				return {
+					content: [{ type: "text" as const, text: lines.join("\n") }],
+					details: { session, alreadyFinished: true, exitCode },
+				};
+			}
+
+			startWatch({ session, command: info.cmd, label: params.label, tailLines });
+			return {
+				content: [{
+					type: "text" as const,
+					text:
+						`Watching zmx session "${session}".\n\n` +
+						"STOP NOW: end your reply immediately. Do not call any more tools and do not add commentary. " +
+						`You will be woken by one message with the exit code and the last ${tailLines} lines of output ` +
+						"when the task exits; that message starts your next turn.",
+				}],
+				details: { session, background: true },
+			};
+		},
+	});
+
+	// ── z m x _ u n w a t c h ───────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "zmx_unwatch",
+		label: "ZMX Unwatch",
+		description:
+			"Stop watching zmx sessions started with zmx_run_background or zmx_watch. No completion message will be sent.",
+		parameters: Type.Object({
+			session: Type.Optional(Type.String({ description: "Session to stop watching" })),
+			all: Type.Optional(Type.Boolean({ description: "Stop watching every session" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (params.all) {
+				const sessions = [...watches.keys()];
+				for (const session of sessions) stopWatch(session);
+				return {
+					content: [{
+						type: "text" as const,
+						text: sessions.length ? `Stopped watching: ${sessions.join(", ")}` : "No active watchers.",
+					}],
+					details: { stopped: sessions },
+				};
+			}
+			if (!params.session) {
+				return {
+					content: [{ type: "text" as const, text: "Provide a `session` or set `all: true`." }],
+					isError: true,
+				};
+			}
+			const stopped = stopWatch(params.session);
+			return {
+				content: [{
+					type: "text" as const,
+					text: stopped
+						? `Stopped watching session "${params.session}".`
+						: `No active watcher for session "${params.session}".`,
+				}],
+				details: { session: params.session, stopped },
 			};
 		},
 	});
