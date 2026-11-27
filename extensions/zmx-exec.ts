@@ -231,8 +231,75 @@ export default async function (pi: ExtensionAPI) {
 		const watch = watches.get(session);
 		if (!watch) return false;
 		watches.delete(session);
+		if (watches.size === 0) resumeTodoReminders();
 		watch.abort.abort();
 		return true;
+	}
+
+	// ── Todo-reminder suppression ───────────────────────────────────────────
+	//
+	// OMP's todo tracker appends a "you stopped with incomplete todos" reminder
+	// and starts another turn whenever the agent ends a turn with open todos.
+	// That defeats a deliberate stop while a zmx task runs, so pause the
+	// session's `todo.reminders` setting while at least one watch is active and
+	// release the override when the last one finishes. Hosts without the
+	// setting (upstream pi) skip this.
+
+	interface TodoReminderSetting {
+		get(scope: unknown): boolean;
+		override(scope: unknown, value: boolean): void;
+		clearOverride(scope: unknown): void;
+	}
+
+	let todoReminderSetting: TodoReminderSetting | null | undefined;
+	let todoRemindersPaused = false;
+
+	function settingsScope(): unknown {
+		return (pi.pi as { settings?: unknown } | undefined)?.settings;
+	}
+
+	async function pauseTodoReminders(): Promise<void> {
+		if (todoRemindersPaused) return;
+		if (todoReminderSetting === undefined) {
+			try {
+				// Dynamic on purpose: this subpath exists only on OMP. A static import
+				// would break the extension on upstream pi, where suppression is a no-op.
+				const registry = await import("@oh-my-pi/pi-coding-agent/config/registry");
+				todoReminderSetting =
+					(registry.lookup("todo.reminders") as TodoReminderSetting | undefined) ?? null;
+			} catch {
+				todoReminderSetting = null;
+			}
+		}
+		const setting = todoReminderSetting;
+		const scope = settingsScope();
+		if (!setting || scope === undefined) return;
+		try {
+			// Already off: leave the user's setting alone, and don't re-enable it later.
+			if (!setting.get(scope)) return;
+			setting.override(scope, false);
+			todoRemindersPaused = true;
+		} catch (err) {
+			log(
+				"warn",
+				`zmx: could not pause todo reminders: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+
+	function resumeTodoReminders(): void {
+		if (!todoRemindersPaused) return;
+		todoRemindersPaused = false;
+		const scope = settingsScope();
+		if (!todoReminderSetting || scope === undefined) return;
+		try {
+			todoReminderSetting.clearOverride(scope);
+		} catch (err) {
+			log(
+				"warn",
+				`zmx: could not resume todo reminders: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
 	}
 
 	async function notifyCompletion(
@@ -293,7 +360,7 @@ export default async function (pi: ExtensionAPI) {
 		deliverNotice(lines.join("\n"));
 	}
 
-	function startWatch(input: { session: string; command?: string; label?: string; tailLines?: number }): void {
+	async function startWatch(input: { session: string; command?: string; label?: string; tailLines?: number }): Promise<void> {
 		const watch: Watch = {
 			session: input.session,
 			command: input.command,
@@ -303,6 +370,8 @@ export default async function (pi: ExtensionAPI) {
 			abort: new AbortController(),
 		};
 		watches.set(watch.session, watch);
+		// Applied before the tool returns, so the stop-time todo check sees it.
+		await pauseTodoReminders();
 
 		void (async () => {
 			let result: { stdout: string; stderr: string; code: number; killed: boolean };
@@ -323,6 +392,7 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 			if (watches.get(watch.session) === watch) watches.delete(watch.session);
+			if (watches.size === 0) resumeTodoReminders();
 			if (watch.abort.signal.aborted) return;
 			await notifyCompletion(watch, result);
 		})().catch(err => {
@@ -336,6 +406,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		for (const watch of watches.values()) watch.abort.abort();
 		watches.clear();
+		resumeTodoReminders();
 	});
 
 	// ── z m x _ r u n ───────────────────────────────────────────────────────
@@ -671,7 +742,7 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 
-			startWatch({ session, command: command.join(" "), label: params.label, tailLines: params.tailLines });
+			await startWatch({ session, command: command.join(" "), label: params.label, tailLines: params.tailLines });
 
 			const tailLines = params.tailLines ?? 20;
 			return {
@@ -680,6 +751,7 @@ export default async function (pi: ExtensionAPI) {
 					text:
 						`Background task started in zmx session "${session}".\n\n` +
 						"STOP NOW: end your reply immediately. Do not call any more tools and do not add commentary. " +
+						"Todo reminders are paused while the task runs. " +
 						`You will be woken by one message with the exit code and the last ${tailLines} lines of output ` +
 						"when the task exits; that message starts your next turn.",
 				}],
@@ -760,13 +832,14 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 
-			startWatch({ session, command: info.cmd, label: params.label, tailLines });
+			await startWatch({ session, command: info.cmd, label: params.label, tailLines });
 			return {
 				content: [{
 					type: "text" as const,
 					text:
 						`Watching zmx session "${session}".\n\n` +
 						"STOP NOW: end your reply immediately. Do not call any more tools and do not add commentary. " +
+						"Todo reminders are paused while the task runs. " +
 						`You will be woken by one message with the exit code and the last ${tailLines} lines of output ` +
 						"when the task exits; that message starts your next turn.",
 				}],

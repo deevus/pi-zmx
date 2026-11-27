@@ -76,6 +76,12 @@ starts either from user input or from the completion message, which carries the
 exit code and the last N lines of output (`tailLines`, default 20). The
 extension runs `zmx wait <session>` in the background while the agent is idle.
 
+While at least one watch is active, the extension pauses the session's
+`todo.reminders` setting and releases the override when the last watch
+finishes. This keeps OMP's "you stopped with incomplete todos" reminder from
+starting an extra turn during an intentional stop. If reminders were already
+off, the setting is left alone; hosts without that setting skip the step.
+
 ```
 zmx_run_background(session="train", command=["python", "train.py"], label="nightly training")
 # → returns immediately; the agent ends its turn
