@@ -82,6 +82,10 @@ finishes. This keeps OMP's "you stopped with incomplete todos" reminder from
 starting an extra turn during an intentional stop. If reminders were already
 off, the setting is left alone; hosts without that setting skip the step.
 
+Multiple zmx sessions can be watched at once (one watch per session). Each
+completion notice reports how many watches are still running and which sessions
+they cover, e.g. `Remaining watches: 1 (train [nightly training]).`
+
 ```
 zmx_run_background(session="train", command=["python", "train.py"], label="nightly training")
 # → returns immediately; the agent ends its turn

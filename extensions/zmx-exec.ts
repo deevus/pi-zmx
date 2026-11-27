@@ -352,6 +352,16 @@ export default async function (pi: ExtensionAPI) {
 			if (tail) lines.push("", `Output tail (last ${watch.tailLines} lines):`, tail);
 		}
 
+		const remaining = [...watches.values()].filter(w => w !== watch);
+		lines.push(
+			"",
+			remaining.length === 0
+				? "Remaining watches: 0."
+				: `Remaining watches: ${remaining.length} (${remaining
+						.map(w => (w.label ? `${w.session} [${w.label}]` : w.session))
+						.join(", ")}).`,
+		);
+
 		lines.push(
 			"",
 			`Continue your previous work now. Full scrollback: zmx_history(session="${watch.session}").`,
@@ -681,6 +691,7 @@ export default async function (pi: ExtensionAPI) {
 			"After zmx_run_background or zmx_watch returns, STOP: make no further tool calls and add no commentary. End your turn immediately.",
 			"You will be woken by one message with the exit code and the output tail; that message starts your next turn. Do NOT poll with zmx_wait or zmx_history.",
 			"Commands in one session run sequentially — do not start a second background task in the same session while one is running.",
+			"Multiple zmx sessions may be watched at once; each completion notice reports how many watches remain.",
 			'No shell wrapper: pass each argument as a separate array element; use ["sh", "-c", "..."] for shell operators.',
 		],
 		parameters: Type.Object({
@@ -776,6 +787,7 @@ export default async function (pi: ExtensionAPI) {
 			"After zmx_watch returns, STOP: make no further tool calls and add no commentary. End your turn immediately.",
 			"You will be woken by one message with the exit code and the output tail; that message starts your next turn. Do NOT poll with zmx_wait.",
 			"Only tasks started with `zmx run` are tracked. An interactive shell session with no command only reports when the session itself ends.",
+			"Multiple zmx sessions may be watched at once; each completion notice reports how many watches remain.",
 			"If the session's last task already finished, the tool returns that result immediately instead of waiting.",
 		],
 		parameters: Type.Object({
